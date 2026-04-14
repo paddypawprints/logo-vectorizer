@@ -1,4 +1,4 @@
-# png-vectorizer
+# logo-vectorizer
 
 AI image generators are great at producing logos, icons, and diagrams — but they output rasters.
 This tool bridges that gap: give it an AI-generated PNG and it produces a clean, scalable SVG
@@ -17,9 +17,9 @@ a single binary (black/white) mask, so they struggle with:
 - **Multi-color logos** — each color layer must be traced independently and stacked
 - **AI-generated images** — noisy edges, anti-aliasing, and subtle gradients confuse threshold-based tracers
 - **Spike artifacts** — iterative optimizers (e.g. gradient descent on control points) can produce sharp
-  unwanted kinks; this tool solves control points analytically, guaranteeing a spike-free result
-- **Hyperparameter tuning** — most tracers expose many interacting knobs; here there is essentially one
-  (`MAX_BEZIER_ERR_PX`) that directly maps to "how close is close enough"
+   unwanted kinks; this tool solves control points analytically, guaranteeing a spike-free result
+- __Hyperparameter tuning__ — most tracers expose many interacting knobs; here there is essentially one
+   (`MAX_BEZIER_ERR_PX`) that directly maps to "how close is close enough"
 
 png-vectorizer quantizes color first, then fits each color region independently — making it a natural
 fit for the flat-color, multi-layer style that AI logo generators tend to produce.
@@ -34,15 +34,15 @@ fit for the flat-color, multi-layer style that AI logo generators tend to produc
 
 <img src="uzumaki.svg" width="704"/>
 
-**3. Color-quantized reference** (`uzumaki_quantized.png`) — the 8-color palette the SVG is matched against:
+__3. Color-quantized reference__ (`uzumaki_quantized.png`) — the 8-color palette the SVG is matched against:
 
 <img src="uzumaki_quantized.png" width="704"/>
 
-**4. SVG re-rasterized preview** (`uzumaki_preview.png`) — the final SVG rendered back to pixels for visual comparison:
+__4. SVG re-rasterized preview__ (`uzumaki_preview.png`) — the final SVG rendered back to pixels for visual comparison:
 
 <img src="uzumaki_preview.png" width="704"/>
 
-**5. 4× pixel diff** (`uzumaki_diff.png`) — difference between the quantized reference and the SVG preview; bright pixels indicate error:
+__5. 4× pixel diff__ (`uzumaki_diff.png`) — difference between the quantized reference and the SVG preview; bright pixels indicate error:
 
 <img src="uzumaki_diff.png" width="704"/>
 
@@ -60,7 +60,7 @@ python src/fit_all.py --input uzumaki.png --output uzumaki.svg \
 2. **Color quantization** — k-means clustering in LAB space → N color layers
 3. **Contour tracing** — marching squares per region (outer boundary + holes)
 4. **Corner detection** — curvature profile; weak corners coalesced away
-5. **D&C Bézier fitting** — each corner-to-corner arc is fitted with the
+5. __D&C Bézier fitting__ — each corner-to-corner arc is fitted with the
    fewest cubic Bézier spans that keep max per-point error ≤ `MAX_BEZIER_ERR_PX`
    (default 2px). Split point at worst-fitting arc position, recurse.
    Control points solved via `np.linalg.lstsq` with chord-length
