@@ -1,9 +1,58 @@
 # png-vectorizer
 
+AI image generators are great at producing logos, icons, and diagrams — but they output rasters.
+This tool bridges that gap: give it an AI-generated PNG and it produces a clean, scalable SVG
+ready for print, animation, or further editing in Illustrator or Figma.
+
 Converts a raster PNG into a clean multi-layer SVG using divide-and-conquer
 least-squares cubic Bézier fitting. No gradient descent — the fit is computed
 analytically in a single pass, so there are no spikes and no hyperparameters
 to tune.
+
+## Why not Inkscape / Potrace / Adobe Live Trace?
+
+Those tools were designed for hand-drawn line art and simple silhouettes. They work by tracing
+a single binary (black/white) mask, so they struggle with:
+
+- **Multi-color logos** — each color layer must be traced independently and stacked
+- **AI-generated images** — noisy edges, anti-aliasing, and subtle gradients confuse threshold-based tracers
+- **Spike artifacts** — iterative optimizers (e.g. gradient descent on control points) can produce sharp
+  unwanted kinks; this tool solves control points analytically, guaranteeing a spike-free result
+- **Hyperparameter tuning** — most tracers expose many interacting knobs; here there is essentially one
+  (`MAX_BEZIER_ERR_PX`) that directly maps to "how close is close enough"
+
+png-vectorizer quantizes color first, then fits each color region independently — making it a natural
+fit for the flat-color, multi-layer style that AI logo generators tend to produce.
+
+## Example — Uzumaki Ramen Shop
+
+**1. Original raster input** (`uzumaki.png`) — the AI-generated PNG as fed into the tool:
+
+<img src="uzumaki.png" width="704"/>
+
+**2. Vectorized SVG** (`uzumaki.svg`) — the output; infinitely scalable, fully editable:
+
+<img src="uzumaki.svg" width="704"/>
+
+**3. Color-quantized reference** (`uzumaki_quantized.png`) — the 8-color palette the SVG is matched against:
+
+<img src="uzumaki_quantized.png" width="704"/>
+
+**4. SVG re-rasterized preview** (`uzumaki_preview.png`) — the final SVG rendered back to pixels for visual comparison:
+
+<img src="uzumaki_preview.png" width="704"/>
+
+**5. 4× pixel diff** (`uzumaki_diff.png`) — difference between the quantized reference and the SVG preview; bright pixels indicate error:
+
+<img src="uzumaki_diff.png" width="704"/>
+
+Command used:
+
+```bash
+python src/fit_all.py --input uzumaki.png --output uzumaki.svg \
+    --preview uzumaki_preview.png --diff uzumaki_diff.png \
+    --colors 8 --flood-bg
+```
 
 ## Algorithm
 

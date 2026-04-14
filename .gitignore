@@ -6,15 +6,7 @@ __pycache__/
 dist/
 build/
 
-# Output files (generated — don't commit)
-*.svg
-*_preview.png
-*_diff.png
-*_quantized.png
 fit_all_out.txt
-
-# Input images (may be proprietary)
-*.png
 
 # macOS
 .DS_Store
