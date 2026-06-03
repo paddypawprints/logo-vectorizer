@@ -101,12 +101,10 @@ def flood_fill_background(arr, tol=40):
     # Mask: pixels within `tol` of bg_color
     diff = np.linalg.norm(arr[:,:,:3].astype(float) - bg_color, axis=2)
     bg_mask = diff <= tol
-    labeled, _ = ndi.label(bg_mask)
-    cl = set()
-    for cy, cx in corners:
-        cl.add(labeled[cy, cx])
-    cl.discard(0)
-    arr[np.isin(labeled, list(cl)), 3] = 0
+    # Make all matching background pixels transparent, including holes that
+    # are isolated from the image corners. This avoids filling isolated loops
+    # inside letters like the R when the interior is the same background color.
+    arr[bg_mask, 3] = 0
     return arr
 
 
@@ -150,9 +148,9 @@ def extract_color_masks(arr, n_colors=8, min_px=MIN_REGION_PX):
         px_count = int(mask.sum())
         if px_count < min_px:
             continue
-        mask = ndi.binary_closing(ndi.binary_opening(mask, iterations=1), iterations=2)
-        # Dilate into neighbouring regions so SVG layers overlap and seams close.
-        # Clip to the overall visible area so we don't leak outside the logo.
+        # Avoid morphological opening/closing here because it can close small
+        # interior counters (e.g. the hole in the 'R'). Keep the mask shape
+        # as-is and only apply optional dilation for seam closure.
         if DILATION_PX > 0:
             mask = ndi.binary_dilation(mask, iterations=DILATION_PX) & visible
         if not mask.any():
@@ -708,6 +706,7 @@ def atypes_str(at): return ','.join(str(int(x)) for x in at)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    global N_STEPS_SEG, MAX_BEZIER_ERR_PX, DILATION_PX
     parser=argparse.ArgumentParser()
     parser.add_argument('--input',   default='logo-plain-transparent.png')
     parser.add_argument('--output',  default='taos_pass1.svg')
@@ -720,15 +719,19 @@ def main():
                         help='Number of colors to quantize to (default: 8)')
     parser.add_argument('--min-px',  type=int, default=MIN_REGION_PX,
                         help='Minimum pixels for a region to be vectorized')
+    parser.add_argument('--max-bezier-err', type=float, default=MAX_BEZIER_ERR_PX,
+                        help='Max per-point error (px) for Bézier fitting (default: 2.0)')
+    parser.add_argument('--dilation-px', type=int, default=DILATION_PX,
+                        help='Mask dilation before contouring (default: 1)')
     parser.add_argument('--flood-bg', action='store_true',
                         help='Flood-fill background to transparent before vectorizing')
     parser.add_argument('--flood-tol', type=int, default=40,
                         help='RGB tolerance for --flood-bg (default: 40)')
     args=parser.parse_args()
 
-    global N_STEPS_SEG
-    if args.steps > 0:
-        N_STEPS_SEG = args.steps
+    N_STEPS_SEG = args.steps if args.steps > 0 else N_STEPS_SEG
+    MAX_BEZIER_ERR_PX = args.max_bezier_err
+    DILATION_PX = args.dilation_px
     verbose=not args.quiet
 
     print(f"Loading {args.input}...")
@@ -742,7 +745,8 @@ def main():
     print(f"Quantizing to {args.colors} colors...")
     color_masks, quantized_rgba = extract_color_masks(arr, n_colors=args.colors, min_px=args.min_px)
     print(f"Found {len(color_masks)} color layers | MAX_GAP={MAX_GAP:.1f}px | "
-          f"SHARP_THRESH={SHARP_THRESH}°\n")
+          f"SHARP_THRESH={SHARP_THRESH}° | MAX_BEZIER_ERR_PX={MAX_BEZIER_ERR_PX} | "
+          f"DILATION_PX={DILATION_PX}\n")
 
     # Pre-count qualifying regions so progress % is accurate
     layer_data = []
