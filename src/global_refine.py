@@ -1,31 +1,33 @@
 """
-Global Bezier Refiner — Pass 2
+Global Bezier Refiner — Pass 2 (gradient-descent polish)
 ================================
-Reads taos_all.svg (produced by fit_all.py, which embeds data-atypes),
+Reads the SVG produced by fit_all.py (which embeds data-atypes),
 reparameterizes smooth anchors as (pos, θ_in, l_in, l_out, δθ) so that
-C1 continuity is a hard constraint, then runs global gradient descent where
-the loss is MSE of the soft-composited render vs the original image —
-meaning ALL layers are optimized together and inter-layer seams close
-naturally.
+C1 continuity is a hard constraint, then polishes every curve with gradient
+descent against the true layer boundary.
 
-After optimization, a greedy pruning pass removes redundant smooth anchors:
-each candidate is replaced with the minimum-curvature bezier between its
-neighbours; if the global image loss doesn't increase beyond ε the removal
-is committed, otherwise reverted.
+Loss: for each subpath, the curve is sampled densely and each sample is
+scored by its distance to the boundary of that layer's pixel mask (a signed
+distance field built from the quantized image). A small penalty keeps the
+curve near its starting shape so it cannot slide along the boundary.
+
+Subpaths that still end up more than --max-drift px from their pass-1
+curve are reverted, so the polish can only make small corrections.
 
 Usage:
-    python global_refine.py                         # full pipeline
-    python global_refine.py --trial                 # 256px, coarse only (~3 min)
+    python global_refine.py --input uz.svg --ref uzumaki.png
+    python global_refine.py --quantized uz_quantized.png    # explicit label image
+    python global_refine.py --trial                 # 256px wide, coarse only
     python global_refine.py --phase coarse          # one phase only
-    python global_refine.py --input taos_all.svg    # explicit input
-    python global_refine.py --no-prune              # skip pruning
 """
 
-import argparse, io, math, re, time
+import argparse, io, math, os, re, time
 import numpy as np
 import torch
 import torch.optim as optim
 from PIL import Image
+from scipy import ndimage as ndi
+from scipy.spatial import cKDTree
 import cairosvg
 
 # ── Device selection ─────────────────────────────────────────────────────────
@@ -37,21 +39,21 @@ else:
 print(f'[backend] PyTorch on {DEVICE}')
 
 # ── Tunable defaults ──────────────────────────────────────────────────────────
-SIGMA_COARSE   = 8.0    # px, edge blur for coarse phase
-SIGMA_MID      = 3.0
-SIGMA_FINE     = 0.8
-STEPS_COARSE   = 400
-STEPS_MID      = 600
-STEPS_FINE     = 400
-LR_COARSE      = 0.8
-LR_MID         = 0.4
-LR_FINE        = 0.15
+# Learning rates are in pixels per step (positions and arm lengths are in px).
+# The curves start from an already-good pass-1 fit, so the steps are small.
+STEPS_COARSE   = 300
+STEPS_MID      = 300
+STEPS_FINE     = 300
+LR_COARSE      = 0.05
+LR_MID         = 0.03
+LR_FINE        = 0.02
 SMOOTH_PRIOR   = 0.01   # λ for δθ² regularisation
-PRUNE_EPS      = 0.05   # max loss increase to accept anchor removal (absolute)
-PRUNE_DT_MAX   = 0.25   # only try anchors with |δθ| < this (radians ~14°)
-PRUNE_LOCAL_LR = 0.3
-PRUNE_STEPS    = 80
-BAND_PX        = 12     # pixels within this distance of any boundary are "active"
+ANCHOR_W       = 0.10   # λ for squared drift from the starting curve (px²)
+HUBER_DELTA    = 2.0    # px; boundary distances beyond this grow linearly
+N_PER_SEG      = 12     # curve samples per bezier segment in the loss
+PATIENCE       = 30     # early-stop a phase after this many stalled steps
+MIN_STEPS      = 50     # never early-stop before this many steps
+MAX_DRIFT      = 1.0    # px; subpaths that end further than this from pass 1 are reverted
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -340,7 +342,7 @@ class LayerParams:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 4.  SOFT-COVERAGE RENDER  (differentiable via distance fields)
+# 4.  CURVE SAMPLING
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def bezier_pts(p0, p1, p2, p3, n=20):
@@ -361,81 +363,6 @@ def sample_curve_pts(A, C, n_per_seg=8):
         p0 = A[i]; p1 = C[i,0]; p2 = C[i,1]; p3 = A[(i+1) % N]
         parts.append(bezier_pts(p0, p1, p2, p3, n_per_seg))
     return torch.cat(parts, dim=0)   # (N*(n+1), 2)
-
-
-def soft_coverage(curve_pts, grid_xy, sigma):
-    """
-    For a set of curve sample points and a grid of pixel positions,
-    compute soft coverage = sigmoid(-min_dist / sigma).
-    curve_pts: (M, 2)
-    grid_xy:   (H*W, 2) — pixel centres in (x, y)
-    Returns:   (H*W,) float in [0,1]
-    """
-    # (H*W, M) squared distances
-    diff = grid_xy.unsqueeze(1) - curve_pts.unsqueeze(0)   # (HW, M, 2)
-    d2   = (diff**2).sum(-1)                                # (HW, M)
-    min_d = d2.min(dim=1).values.sqrt()                     # (HW,)
-    return torch.sigmoid(-min_d / sigma)                    # (HW,)
-
-
-def build_pixel_grid(H, W, device='cpu'):
-    """Returns (H*W, 2) tensor of pixel (x, y) centres."""
-    ys = torch.arange(H, dtype=torch.float32, device=device)
-    xs = torch.arange(W, dtype=torch.float32, device=device)
-    yy, xx = torch.meshgrid(ys, xs, indexing='ij')
-    return torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=1)
-
-
-def render_composite(all_layer_params, colors_rgb, H, W, sigma,
-                     scale=1.0, n_per_seg=8, band_mask=None):
-    """
-    Differentiably render all layers composited onto white background.
-    all_layer_params: list of LayerParams (one per subpath, in paint order)
-    colors_rgb: list of (3,) float32 tensors matching all_layer_params
-    Returns (H, W, 3) float tensor.
-    """
-    grid = build_pixel_grid(H, W, device=DEVICE)            # (HW, 2)
-    if band_mask is not None:
-        active_idx = band_mask.nonzero(as_tuple=True)[0]  # subset for speed
-        active_grid = grid[active_idx]
-    else:
-        active_idx = None
-        active_grid = grid
-
-    canvas = torch.ones(H * W, 3, device=DEVICE)   # white background
-
-    for lp, color in zip(all_layer_params, colors_rgb):
-        A, C = lp.build_AC()
-        # Scale if using downsampled render
-        if scale != 1.0:
-            A = A * scale
-            C = C * scale
-        curve = sample_curve_pts(A, C, n_per_seg)   # (M, 2)
-        cov   = soft_coverage(curve, active_grid, sigma)   # (active,)
-        col_t = color.unsqueeze(0)                         # (1, 3)
-        if active_idx is not None:
-            # Paint only active pixels; rest unchanged
-            painted = canvas[active_idx] * (1 - cov.unsqueeze(1)) + col_t * cov.unsqueeze(1)
-            canvas = canvas.clone()
-            canvas[active_idx] = painted
-        else:
-            canvas = canvas * (1 - cov.unsqueeze(1)) + col_t * cov.unsqueeze(1)
-
-    return canvas.reshape(H, W, 3)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 5.  GLOBAL LOSS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def global_loss(all_lps, colors_rgb, target_rgb, H, W, sigma,
-                scale, n_per_seg, band_mask, smooth_prior_w, visible_mask):
-    rendered = render_composite(all_lps, colors_rgb, H, W, sigma,
-                                scale, n_per_seg, band_mask)
-    mse = ((rendered - target_rgb) ** 2)
-    if visible_mask is not None:
-        mse = mse[visible_mask]
-    return mse.mean()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -491,153 +418,80 @@ def write_svg(path, w, h, layers_data, stroke_width=0.0):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 7.  MINIMUM-CURVATURE REPLACEMENT  (for pruning)
+# 7.  CURVE GEOMETRY HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def min_curvature_arms(p0, p3, th0, th3):
-    """
-    Given endpoints p0, p3 and outgoing tangent direction at p0 (th0)
-    and incoming tangent direction at p3 (th3 = angle of v INTO p3),
-    find arm lengths l0, l3 that minimise integral of squared curvature.
+def _bez_np(p0, c0, c1, p3, n):
+    t = np.linspace(0.0, 1.0, n)[:, None]
+    mt = 1.0 - t
+    return mt**3 * p0 + 3 * mt**2 * t * c0 + 3 * mt * t**2 * c1 + t**3 * p3
 
-    For a symmetric case the optimal lengths are chord/3 each.
-    For the general asymmetric case we use the "cubic hermite elastica"
-    approximation:  l = |chord| / 3, adjusted by a factor that scales
-    with the angle between chord and tangent.
-    """
-    chord = p3 - p0
-    L = np.linalg.norm(chord)
-    if L < 1e-6:
-        return 1.0, 1.0
-    # Use the one-third rule as the baseline
-    l0 = L / 3.0
-    l3 = L / 3.0
-    return l0, l3
+
+def dense_curve_np(params, spacing=0.5):
+    """Closed curve sampled about every `spacing` px, so point-to-point
+    distances approximate point-to-curve distances to within spacing/2."""
+    A, C = params_to_AC(params)
+    N = len(A)
+    out = []
+    for i in range(N):
+        p0, c0, c1, p3 = A[i], C[i, 0], C[i, 1], A[(i + 1) % N]
+        poly = (np.linalg.norm(c0 - p0) + np.linalg.norm(c1 - c0)
+                + np.linalg.norm(p3 - c1))
+        out.append(_bez_np(p0, c0, c1, p3, int(np.clip(poly / spacing, 8, 800))))
+    return np.vstack(out)
+
+
+def hausdorff(P, Q, tree_Q=None):
+    tq = tree_Q if tree_Q is not None else cKDTree(Q)
+    if Q is None:
+        Q = tq.data
+    return max(float(tq.query(P)[0].max()), float(cKDTree(P).query(Q)[0].max()))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 8.  PRUNING PASS
+# 8.  BOUNDARY DISTANCE FIELDS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def compute_loss_np(all_lps, colors_rgb, target_t, H, W, scale):
-    with torch.no_grad():
-        return curve_sample_loss(all_lps, colors_rgb, target_t, H, W, scale).item()
+def load_label_map(rgba, layer_colors):
+    """Assign each visible pixel to the nearest layer colour (-1 = background)."""
+    vis = rgba[:, :, 3] > 128
+    pal = np.array([[int(c[i:i + 2], 16) for i in (1, 3, 5)] for c in layer_colors],
+                   dtype=np.int32)
+    rgb = rgba[vis][:, :3].astype(np.int32)
+    best = np.full(len(rgb), np.iinfo(np.int32).max, dtype=np.int64)
+    lab = np.zeros(len(rgb), dtype=np.int32)
+    for k in range(len(pal)):
+        dk = ((rgb - pal[k]) ** 2).sum(axis=1)
+        better = dk < best
+        best[better] = dk[better]
+        lab[better] = k
+    labels = np.full(rgba.shape[:2], -1, dtype=np.int32)
+    labels[vis] = lab
+    return labels
 
 
-def prune_global(all_lps, colors_rgb, target_t, H, W, scale,
-                 batch_frac=0.10, reopt_steps=50, reopt_lr=0.3,
-                 eps=PRUNE_EPS, dt_max=PRUNE_DT_MAX, verbose=True):
+def build_boundary_fields(labels, n_layers, dilation=0):
     """
-    Batched global pruning:
-      1. Collect all smooth anchors with |δθ| < dt_max, sort ascending
-      2. Remove the least-sensitive batch_frac fraction
-      3. Short global re-opt (reopt_steps)
-      4. Accept if loss <= base + eps, else revert and stop
-      5. Repeat until rejected or no candidates left
-    Returns total anchors removed.
+    Signed distance (px) to each layer's mask boundary, positive inside.
+    The boundary sits half a pixel from the nearest pixel centres, matching
+    the 0.5 level-set contours produced in pass 1.
     """
-    total_removed = 0
-    base_loss = compute_loss_np(all_lps, colors_rgb, target_t, H, W, scale)
-
-    for round_num in range(20):   # safety cap
-        # ── collect candidates ────────────────────────────────────────────
-        candidates = []  # (dth, lp_idx, anchor_i)
-        for lp_idx, lp in enumerate(all_lps):
-            if lp.s_dth is None:
-                continue
-            for k, i in enumerate(lp.smooth_idx):
-                dth = abs(lp.s_dth[k].detach().item())
-                if dth < dt_max:
-                    candidates.append((dth, lp_idx, i))
-        if not candidates:
-            break
-        candidates.sort()
-        batch_size = max(1, int(len(candidates) * batch_frac))
-        batch = candidates[:batch_size]
-        if verbose:
-            print(f"  Round {round_num+1}: {len(candidates)} candidates, "
-                  f"batch={batch_size}  base_loss={base_loss:.5f}", flush=True)
-
-        # ── snapshot affected subpaths ────────────────────────────────────
-        affected = set(lp_idx for _, lp_idx, _ in batch)
-        snapshots = {lp_idx: ([dict(p) for p in all_lps[lp_idx].params],
-                               getattr(all_lps[lp_idx], 'atype', None))
-                     for lp_idx in affected}
-
-        # ── apply removals (highest index first per subpath) ──────────────
-        removals_by_lp = {}
-        for _, lp_idx, i in batch:
-            removals_by_lp.setdefault(lp_idx, []).append(i)
-
-        for lp_idx, indices in removals_by_lp.items():
-            lp      = all_lps[lp_idx]
-            params  = [dict(p) for p in lp.params]
-            atype   = list(getattr(lp, 'atype', [0]*len(params)))
-            for i in sorted(set(indices), reverse=True):
-                N = len(params)
-                if N <= 4:
-                    break
-                prev_i = (i - 1) % N
-                next_i = (i + 1) % N
-                p0  = params[prev_i]['pos']
-                p3  = params[next_i]['pos']
-                th0 = params[prev_i].get('th_in', 0) + params[prev_i].get('dth', 0)
-                th3 = params[next_i].get('th_in', 0)
-                l0, l3 = min_curvature_arms(p0, p3, th0, th3)
-                # build reduced lists
-                new_prev = prev_i if prev_i < i else prev_i - 1
-                new_next = (next_i - 1 if next_i > i else next_i) % (N - 1)
-                params = [p for j, p in enumerate(params) if j != i]
-                atype  = [a for j, a in enumerate(atype)  if j != i]
-                if params[new_prev]['type'] == 'smooth':
-                    params[new_prev] = dict(params[new_prev])
-                    params[new_prev]['l_out'] = l0
-                if params[new_next]['type'] == 'smooth':
-                    params[new_next] = dict(params[new_next])
-                    params[new_next]['l_in']  = l3
-            new_lp = LayerParams(params)
-            new_lp.atype = np.array(atype, dtype=np.int32)
-            lp.__dict__.update(new_lp.__dict__)
-
-        # ── short global re-opt ───────────────────────────────────────────
-        all_params = [t for lp in all_lps for t in lp.torch_tensors()]
-        opt = optim.Adam(all_params, lr=reopt_lr)
-        for _ in range(reopt_steps):
-            opt.zero_grad()
-            loss = (curve_sample_loss(all_lps, colors_rgb, target_t, H, W, scale)
-                    + SMOOTH_PRIOR * sum(lp.smooth_prior_loss() for lp in all_lps)
-                    / max(len(all_lps), 1))
-            loss.backward()
-            opt.step()
-
-        new_loss = compute_loss_np(all_lps, colors_rgb, target_t, H, W, scale)
-
-        if new_loss <= base_loss + eps:
-            for lp in all_lps:
-                lp.sync_back()
-            total_removed += batch_size
-            base_loss = new_loss
-            if verbose:
-                print(f"    Accepted → loss={new_loss:.5f}  "
-                      f"total_removed={total_removed}", flush=True)
+    fields = []
+    for k in range(n_layers):
+        m = labels == k
+        if dilation > 0:
+            m = ndi.binary_dilation(m, iterations=dilation) & (labels >= 0)
+        if not m.any() or m.all():
+            sd = np.full(m.shape, 1e3 if m.all() else -1e3, dtype=np.float32)
         else:
-            # Revert affected subpaths
-            for lp_idx, (snap_params, snap_atype) in snapshots.items():
-                lp = all_lps[lp_idx]
-                new_lp = LayerParams(snap_params)
-                if snap_atype is not None:
-                    new_lp.atype = snap_atype
-                lp.__dict__.update(new_lp.__dict__)
-            if verbose:
-                print(f"    Rejected: {new_loss:.5f} > {base_loss:.5f}+{eps}, stopping",
-                      flush=True)
-            break
-
-    return total_removed
+            sd = np.where(m, ndi.distance_transform_edt(m) - 0.5,
+                          -(ndi.distance_transform_edt(~m) - 0.5)).astype(np.float32)
+        fields.append(torch.tensor(sd, device=DEVICE).unsqueeze(-1))   # (H, W, 1)
+    return fields
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 9.  CURVE-SAMPLE LOSS  (replaces pixel-render loss — cheap on MPS)
+# 9.  BOUNDARY-FIT LOSS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def bilinear_sample(ref_t, pts):   # noqa: E302
@@ -667,31 +521,94 @@ def bilinear_sample(ref_t, pts):   # noqa: E302
           + c11 * (wx1 * wy1).unsqueeze(1))
 
 
-def curve_sample_loss(all_lps, colors_rgb, ref_t, H, W, scale, n_per_seg=10):
+def snapshot_samples(all_lps, scale, n_per_seg=N_PER_SEG):
+    """Detached curve samples for every subpath (the 'stay near here' target)."""
+    out = []
+    with torch.no_grad():
+        for lp in all_lps:
+            A, C = lp.build_AC()
+            out.append(sample_curve_pts(A * scale, C * scale, n_per_seg).clone())
+    return out
+
+
+def make_loss_fn(all_lps, fields, ref_pts, scale, smooth_w, anchor_w,
+                 n_per_seg=N_PER_SEG, delta=HUBER_DELTA):
     """
-    Sample points along each bezier curve, look up reference colour via
-    bilinear interpolation, penalise colour mismatch.
-    ref_t  : (H, W, 3) float32 on DEVICE
-    Returns: scalar loss
+    Returns loss_fn() -> (total, fit).
+      fit   : pseudo-Huber of each curve sample's distance (full-res px) to the
+              boundary of its own layer; averaged over samples, then subpaths.
+      total : fit + anchor_w * drift from ref_pts + smooth_w * dθ² prior.
+    `fields[i]` is the signed boundary distance field for all_lps[i].
     """
-    total = torch.tensor(0., device=DEVICE)
-    for lp, color in zip(all_lps, colors_rgb):
-        A, C = lp.build_AC()
-        if scale != 1.0:
-            A = A * scale
-            C = C * scale
-        pts = sample_curve_pts(A, C, n_per_seg)   # (M, 2)  x=col, y=row
-        sampled = bilinear_sample(ref_t, pts)      # (M, 3)
-        total = total + ((sampled - color.unsqueeze(0)) ** 2).mean()
-    return total / max(len(all_lps), 1)
+    def loss_fn():
+        fit = torch.tensor(0., device=DEVICE)
+        drift = torch.tensor(0., device=DEVICE)
+        prior = torch.tensor(0., device=DEVICE)
+        for lp, fld, r0 in zip(all_lps, fields, ref_pts):
+            A, C = lp.build_AC()
+            pts = sample_curve_pts(A * scale, C * scale, n_per_seg)
+            d = bilinear_sample(fld, pts).squeeze(1) / scale
+            fit = fit + (delta ** 2 * (torch.sqrt(1 + (d / delta) ** 2) - 1)).mean()
+            drift = drift + ((pts - r0) ** 2).sum(1).mean() / scale ** 2
+            prior = prior + lp.smooth_prior_loss()
+        n = max(len(all_lps), 1)
+        fit, drift, prior = fit / n, drift / n, prior / n
+        return fit + anchor_w * drift + smooth_w * prior, fit
+    return loss_fn
+
+
+def boundary_stats(all_lps, fields, scale, n_per_seg=16):
+    """Distance (full-res px) from curve samples to their layer boundary."""
+    ds = []
+    with torch.no_grad():
+        for lp, fld in zip(all_lps, fields):
+            A, C = lp.build_AC()
+            pts = sample_curve_pts(A * scale, C * scale, n_per_seg)
+            ds.append((bilinear_sample(fld, pts).squeeze(1) / scale).abs())
+    d = torch.cat(ds).cpu().numpy()
+    return {'mean': float(d.mean()), 'p95': float(np.percentile(d, 95)),
+            'max': float(d.max()), 'gt1': float((d > 1.0).mean() * 100),
+            'gt2': float((d > 2.0).mean() * 100)}
+
+
+def print_stats(tag, s):
+    print(f"  [{tag}] boundary dist px: mean={s['mean']:.3f} p95={s['p95']:.2f} "
+          f"max={s['max']:.2f}  >1px={s['gt1']:.1f}%  >2px={s['gt2']:.1f}%", flush=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 10.  OPTIMISATION PHASE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_phase(all_lps, colors_rgb, target_t, H, W, sigma, scale,
-              n_steps, lr, label, smooth_prior_w, visible_mask, verbose):
+def _snapshot_state(lp):
+    return {k: (v.detach().clone() if isinstance(v, torch.Tensor) else v)
+            for k, v in lp.__dict__.items() if not k.startswith('_')}
+
+
+def revert_drifters(all_lps, originals, max_drift):
+    """Restore any subpath whose curve moved more than max_drift px
+    (Hausdorff) from its starting curve. Returns number reverted."""
+    n = 0
+    for lp, (state, ref_pts) in zip(all_lps, originals):
+        lp.sync_back()
+        cur = dense_curve_np(lp.params)
+        if hausdorff(cur, ref_pts) > max_drift:
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    getattr(lp, k).data.copy_(v)
+            lp.sync_back()
+            n += 1
+    return n
+
+
+def run_phase(all_lps, loss_fn, n_steps, lr, label, verbose,
+              patience=PATIENCE, tol=1e-3, min_steps=MIN_STEPS, target_loss=0.0):
+    """
+    Adam with cosine-annealed lr. Early-stops when the best fit has not
+    improved by a relative `tol` for `patience` steps (never before
+    `min_steps`), or once it reaches `target_loss`. patience=0 disables
+    early stopping. The best state seen is restored at the end.
+    """
     all_params = []
     for lp in all_lps:
         all_params += lp.torch_tensors()
@@ -701,34 +618,46 @@ def run_phase(all_lps, colors_rgb, target_t, H, W, sigma, scale,
     best = {'loss': 1e9, 'state': None}
     t0 = time.time()
 
-    # n_per_seg scales with sigma: coarse phase uses fewer samples for speed
-    n_per_seg = max(4, int(sigma * 2))
-
-    log_every = max(1, n_steps // 20)
+    log_every = max(1, n_steps // 10)
+    stall = 0
+    ref_loss = float('inf')   # best fit at the last meaningful improvement
+    stop_reason = None
     for step in range(n_steps):
         optimizer.zero_grad()
-        mse   = curve_sample_loss(all_lps, colors_rgb, target_t, H, W, scale, n_per_seg)
-        prior = sum(lp.smooth_prior_loss() for lp in all_lps) / max(len(all_lps), 1)
-        loss  = mse + smooth_prior_w * prior
-        loss.backward()
+        total, fit = loss_fn()
+        total.backward()
         torch.nn.utils.clip_grad_norm_(all_params, 5.0)
         optimizer.step()
         scheduler.step()
 
-        if mse.detach().item() < best['loss']:
-            best['loss'] = mse.detach().item()
+        cur = fit.detach().item()
+        if cur < best['loss']:
+            best['loss'] = cur
             best['state'] = [{k: (v.detach().clone() if isinstance(v, torch.Tensor) else v)
                               for k, v in lp.__dict__.items()
                               if not k.startswith('_')}
                              for lp in all_lps]
 
+        if cur < ref_loss * (1.0 - tol):
+            ref_loss = cur
+            stall = 0
+        else:
+            stall += 1
+        if target_loss > 0 and best['loss'] <= target_loss:
+            stop_reason = f"target fit {target_loss} reached"
+        elif patience > 0 and step + 1 >= min_steps and stall >= patience:
+            stop_reason = f"no >{tol:.1%} improvement for {patience} steps"
+
         if verbose and step % log_every == 0:
             eta = (time.time() - t0) / max(step, 1) * (n_steps - step)
-            print(f"  {label} {step:4d}/{n_steps}: loss={mse.detach().item():.5f} "
-                  f"prior={prior.detach().item():.4f}  "
+            print(f"  {label} {step:4d}/{n_steps}: fit={cur:.5f} "
                   f"best={best['loss']:.5f}  eta={eta:.0f}s", flush=True)
 
-    print(f"  {label} best loss={best['loss']:.5f}  ({time.time()-t0:.0f}s)")    # Restore best
+        if stop_reason:
+            print(f"  {label} early stop at step {step + 1}/{n_steps}: {stop_reason}")
+            break
+
+    print(f"  {label} best fit={best['loss']:.5f}  ({time.time()-t0:.0f}s)")
     for lp, state in zip(all_lps, best['state']):
         for k, v in state.items():
             if isinstance(v, torch.Tensor):
@@ -738,7 +667,7 @@ def run_phase(all_lps, colors_rgb, target_t, H, W, sigma, scale,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 10.  MAIN
+# 11.  MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
@@ -752,10 +681,22 @@ def main():
                     help='Fast trial: 256px, coarse phase only')
     ap.add_argument('--phase',    default='all',
                     choices=['coarse', 'mid', 'fine', 'all'])
-    ap.add_argument('--no-prune', action='store_true')
     ap.add_argument('--quiet',    action='store_true')
     ap.add_argument('--smooth-w', type=float, default=SMOOTH_PRIOR)
-    ap.add_argument('--prune-eps',type=float, default=PRUNE_EPS)
+    ap.add_argument('--quantized', default=None,
+                    help='Quantized reference PNG (default: <input>_quantized.png if present)')
+    ap.add_argument('--mask-dilation', type=int, default=0,
+                    help='Must match the --dilation-px used in pass 1 (default 0)')
+    ap.add_argument('--max-drift', type=float, default=MAX_DRIFT)
+    ap.add_argument('--anchor-w', type=float, default=ANCHOR_W)
+    ap.add_argument('--lr-scale', type=float, default=1.0,
+                    help='Multiplier applied to every phase learning rate (default 1.0)')
+    ap.add_argument('--patience', type=int, default=PATIENCE,
+                    help='Early-stop a phase after this many steps without improvement (0 = off)')
+    ap.add_argument('--tol',      type=float, default=1e-3,
+                    help='Relative loss improvement that counts as progress (default 1e-3)')
+    ap.add_argument('--target-loss', type=float, default=0.0,
+                    help='Stop a phase once MSE reaches this value (default 0 = off)')
     args = ap.parse_args()
     verbose = not args.quiet
 
@@ -792,61 +733,66 @@ def main():
 
     print(f"  Total subpaths: {len(all_lps)}, anchors: {total_anchors}")
 
-    # ── Load reference ────────────────────────────────────────────────────────
+    # ── Load reference / labels ───────────────────────────────────────────────
     print(f"Loading reference {args.ref}...")
     orig_rgba = np.array(Image.open(args.ref).convert('RGBA'))
-    orig_hw   = orig_rgba.shape[:2]
-    visible   = orig_rgba[:,:,3] > 128
+    visible   = orig_rgba[:, :, 3] > 128
+    qpath = args.quantized
+    if not qpath:
+        sib = args.input.replace('.svg', '_quantized.png')
+        qpath = sib if os.path.exists(sib) else None
+    if qpath:
+        print(f"  Labels from {qpath}")
+        lab_src = np.array(Image.open(qpath).convert('RGBA'))
+        lab_src[:, :, 3] = orig_rgba[:, :, 3]
+    else:
+        print("  Labels from nearest layer colour of reference")
+        lab_src = orig_rgba
+    labels = load_label_map(lab_src, [c for c, _ in raw_layers])
 
-    # ── Determine working resolution ─────────────────────────────────────────
     if args.trial:
-        W = H = 256
+        W = 256
+        H = max(1, round(full_h * W / full_w))
         phases = ['coarse']
     else:
-        phases = (['coarse', 'mid', 'fine'] if args.phase == 'all'
-                  else [args.phase])
         H, W = full_h, full_w
-
+        phases = (['coarse', 'mid', 'fine'] if args.phase == 'all' else [args.phase])
     scale = W / full_w
-
-    # Pre-scale reference to working resolution
-    ref_img = Image.fromarray(orig_rgba).resize((W, H), Image.LANCZOS).convert('RGB')
-    ref_np  = np.array(ref_img).astype(np.float32) / 255.0
-    target_t = torch.tensor(ref_np, device=DEVICE)
-
-    vis_small = np.array(Image.fromarray(visible.astype(np.uint8)*255)
-                         .resize((W, H), Image.NEAREST)) > 128
-    visible_mask = torch.tensor(vis_small.reshape(-1), device=DEVICE)   # (H*W,) bool
-
-    # ── Phase configs ─────────────────────────────────────────────────────────
-    phase_cfg = {
-        'coarse': (SIGMA_COARSE, STEPS_COARSE, LR_COARSE),
-        'mid':    (SIGMA_MID,    STEPS_MID,    LR_MID),
-        'fine':   (SIGMA_FINE,   STEPS_FINE,   LR_FINE),
-    }
+    if (H, W) != labels.shape:
+        labels = np.array(Image.fromarray(labels.astype(np.int16)).resize((W, H), Image.NEAREST)
+                          ).astype(np.int32)
+    fields_by_layer = build_boundary_fields(labels, len(raw_layers), args.mask_dilation)
+    fields = []
+    for li, (_, layer_regions) in enumerate(structured):
+        for region_lps in layer_regions:
+            fields += [fields_by_layer[li]] * len(region_lps)
 
     # ── Optimisation ─────────────────────────────────────────────────────────
-    for ph in phases:
-        sigma, n_steps, lr = phase_cfg[ph]
-        if args.trial and ph == 'coarse':
-            n_steps = min(n_steps, 200)
-        print(f"\n{'='*60}")
-        print(f"Phase {ph}: H={H} W={W} σ={sigma} steps={n_steps} lr={lr}")
-        run_phase(all_lps, all_colors, target_t, H, W, sigma, scale,
-                  n_steps, lr, ph, args.smooth_w, visible_mask, verbose)
+    def make_fn():
+        return make_loss_fn(all_lps, fields, snapshot_samples(all_lps, scale),
+                            scale, args.smooth_w, args.anchor_w)
 
-    # ── Pruning ───────────────────────────────────────────────────────────────
-    if not args.no_prune:
-        print(f"\n{'='*60}")
-        reopt_steps = 20 if args.trial else 50
-        removed = prune_global(all_lps, all_colors, target_t, H, W, scale,
-                               batch_frac=0.10, reopt_steps=reopt_steps,
-                               eps=args.prune_eps, verbose=verbose)
-        remaining = sum(len(lp.params) for lp in all_lps)
-        print(f"  Total removed: {removed}  Remaining: {remaining} (was {total_anchors})")
+    print_stats('start', boundary_stats(all_lps, fields, scale))
+    originals = []
+    for lp in all_lps:
+        lp.sync_back()
+        originals.append((_snapshot_state(lp), dense_curve_np(lp.params)))
+    phase_cfg = {'coarse': (STEPS_COARSE, LR_COARSE), 'mid': (STEPS_MID, LR_MID),
+                 'fine': (STEPS_FINE, LR_FINE)}
+    for ph in phases:
+        n_steps, lr = phase_cfg[ph]
+        lr *= args.lr_scale
+        if args.trial:
+            n_steps = min(n_steps, 100)
+        print(f"\n{'='*60}\nPhase {ph}: {H}x{W} steps={n_steps} lr={lr}")
+        run_phase(all_lps, make_fn(), n_steps, lr, ph, verbose,
+                  patience=args.patience, tol=args.tol, target_loss=args.target_loss)
+    nrev = revert_drifters(all_lps, originals, args.max_drift)
+    print(f"  Reverted {nrev}/{len(all_lps)} subpaths that drifted > {args.max_drift} px")
+    print_stats('polished', boundary_stats(all_lps, fields, scale))
 
     # ── Write SVG ─────────────────────────────────────────────────────────────
-    # Rebuild structured layer data from (possibly pruned) LayerParams
+    # Rebuild structured layer data from LayerParams
     out_layers = []
     lp_iter = iter(all_lps)
     for color, layer_regions in structured:

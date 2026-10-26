@@ -32,6 +32,7 @@ import torch.optim as optim
 from PIL import Image
 from scipy import ndimage as ndi
 from scipy.ndimage import gaussian_filter1d
+from scipy.spatial import cKDTree
 from skimage import measure
 from skimage.color import rgb2lab, lab2rgb
 from scipy.ndimage import distance_transform_edt, binary_erosion
@@ -61,11 +62,18 @@ N_STEPS_SEG           = 200   # optimisation steps per bezier segment (initial f
 N_STEPS_REFIT         = 50    # gradient descent steps after each anchor removal
 LR_SEG                = 1.5   # learning rate for per-segment optimiser
 PRUNE_PIXEL_TOLERANCE = 20    # max pixel-wedge area to allow anchor pruning
-MAX_BEZIER_ERR_PX     =  2.0  # max per-point error (px) for one bezier span before splitting
+MAX_BEZIER_ERR_PX     =  1.0  # max per-point error (px) for one bezier span before splitting
 C1_WEIGHT             =  1.0
 PRUNE_ANGLE_THRESH    =  4.0
-MIN_REGION_PX         = 300   # skip regions smaller than this
-DILATION_PX           =   1   # expand each mask by this many px to close seams
+MIN_REGION_PX         = 20    # skip regions smaller than this
+DILATION_PX           =   0   # expand each mask by this many px to close seams
+
+# Speed options (all exposed on the CLI)
+KMEANS_SAMPLE         = 0       # fit k-means on this many pixels (0 = all), then predict all
+KMEANS_N_INIT         = 3       # k-means restarts
+BEZIER_SEARCH         = 'kdtree'  # nearest-point search for fit error: 'kdtree' or 'brute'
+REGION_CROP           = True    # contour each region inside its bounding box, not the full image
+CORNER_COALESCE       = 'dc'  # 'dc' (closed-form), 'gradient' (original, slow), or 'off'
 
 # Progress tracking (updated in main)
 _progress = {'done': 0, 'total': 0}
@@ -85,7 +93,7 @@ def remove_black_background(arr):
     return arr
 
 
-def flood_fill_background(arr, tol=40):
+def flood_fill_background(arr, tol=40, shadow_tol=0.08):
     """Flood-fill background to transparent by sampling the corner pixel color.
     Finds all connected components of pixels within `tol` RGB distance of the
     most common corner color, then makes corner-touching components transparent."""
@@ -101,6 +109,18 @@ def flood_fill_background(arr, tol=40):
     # Mask: pixels within `tol` of bg_color
     diff = np.linalg.norm(arr[:,:,:3].astype(float) - bg_color, axis=2)
     bg_mask = diff <= tol
+    if shadow_tol > 0:
+        # Drop shadows keep the background hue but are darker, so they fall
+        # outside the RGB tolerance. Match on colour direction instead, and keep
+        # only matches connected to the background so logo pixels are never hit.
+        rgb = arr[:,:,:3].astype(float)
+        norm = np.linalg.norm(rgb, axis=2)
+        unit = rgb / np.maximum(norm, 1e-6)[..., None]
+        bg_unit = bg_color / max(np.linalg.norm(bg_color), 1e-6)
+        shadow = (np.linalg.norm(unit - bg_unit, axis=2) <= shadow_tol) & (norm > 30)
+        lab, _ = ndi.label(shadow | bg_mask)
+        touching = np.unique(np.concatenate([lab[0], lab[-1], lab[:,0], lab[:,-1]]))
+        bg_mask = bg_mask | (shadow & np.isin(lab, touching[touching > 0]))
     # Make all matching background pixels transparent, including holes that
     # are isolated from the image corners. This avoids filling isolated loops
     # inside letters like the R when the interior is the same background color.
@@ -120,7 +140,8 @@ def extract_color_masks(arr, n_colors=8, min_px=MIN_REGION_PX):
 
     h, w = arr.shape[:2]
     vis_ys, vis_xs = np.where(visible)
-    vis_rgb = arr[vis_ys, vis_xs, :3].astype(np.float32) / 255.0
+    # float64 avoids the divide-by-zero/overflow warnings seen with float32 input
+    vis_rgb = arr[vis_ys, vis_xs, :3].astype(np.float64) / 255.0
 
     # K-means in LAB space for perceptually correct separation
     vis_lab = rgb2lab(vis_rgb.reshape(1, -1, 3)).reshape(-1, 3)
@@ -128,9 +149,15 @@ def extract_color_masks(arr, n_colors=8, min_px=MIN_REGION_PX):
     scale = np.array([100.0, 128.0, 128.0])
     vis_norm = vis_lab / scale
 
-    km = KMeans(n_clusters=n_colors, init='k-means++', n_init=3,
+    km = KMeans(n_clusters=n_colors, init='k-means++', n_init=KMEANS_N_INIT,
                 max_iter=100, random_state=42)
-    labels = km.fit_predict(vis_norm)
+    if 0 < KMEANS_SAMPLE < len(vis_norm):
+        rng = np.random.default_rng(42)
+        sample = vis_norm[rng.choice(len(vis_norm), KMEANS_SAMPLE, replace=False)]
+        km.fit(sample)
+        labels = km.predict(vis_norm)
+    else:
+        labels = km.fit_predict(vis_norm)
     centroids_norm = km.cluster_centers_
 
     # Convert centroids back to sRGB hex
@@ -223,6 +250,41 @@ def find_corners(s, curv, thresh=15.0, min_gap=20, min_dist_px=15.0):
                        all(np.linalg.norm(s[c]-s[o])>=min_dist_px for o in out)):
             out.append(c)
     return sorted(out)
+
+def coalesce_corners_dc(s, curv, corners, max_err_px):
+    """
+    Closed-form corner pruning. A corner is removed when fitting the merged
+    arc (neighbouring corners joined) needs no more bezier spans than the
+    two arcs on either side of it need separately. Both fits are bounded by
+    max_err_px, so fewer-or-equal spans means no loss in accuracy per anchor.
+    Weakest-curvature corners are tried first; no gradient descent involved.
+    """
+    n = len(s)
+    cache = {}
+
+    def arc_of(a, b):
+        return s[a:b + 1] if b > a else np.vstack([s[a:], s[:b + 1]])
+
+    def spans(a, b):
+        key = (a, b)
+        if key not in cache:
+            cache[key] = len(_fit_arc_divide(arc_of(a, b), max_err_px))
+        return cache[key]
+
+    corners = sorted(corners)
+    changed = True
+    while changed and len(corners) > 2:
+        changed = False
+        for ci in sorted(range(len(corners)), key=lambda i: curv[corners[i]]):
+            prev_c = corners[(ci - 1) % len(corners)]
+            cur_c  = corners[ci]
+            next_c = corners[(ci + 1) % len(corners)]
+            if spans(prev_c, next_c) <= spans(prev_c, cur_c) + spans(cur_c, next_c):
+                corners = corners[:ci] + corners[ci + 1:]
+                changed = True
+                break
+    return corners
+
 
 def coalesce_corners_by_loss(s, curv, corners, tgt, quick_steps=40, tol=0.05):
     """
@@ -549,11 +611,17 @@ def _bezier_max_error(p0, c0, c1, p3, arc):
     Max distance from any arc point to the nearest point on the bezier.
     Used as the splitting criterion in divide-and-conquer fitting.
     """
+    return float(_bezier_point_dists(p0, c0, c1, p3, arc).max())
+
+
+def _bezier_point_dists(p0, c0, c1, p3, arc):
+    """Distance from each arc point to the nearest sampled point on the bezier."""
     n_samp = max(len(arc) * 2, 64)
     bpts   = _sample_bezier_np(p0, c0, c1, p3, n=n_samp)
-    diff   = arc[:, None, :] - bpts[None, :, :]     # (M, N, 2)
-    dists  = np.sqrt((diff ** 2).sum(axis=2)).min(axis=1)  # (M,)
-    return float(dists.max())
+    if BEZIER_SEARCH == 'kdtree':
+        return cKDTree(bpts).query(arc)[0]
+    diff = arc[:, None, :] - bpts[None, :, :]       # (M, N, 2)
+    return np.sqrt((diff ** 2).sum(axis=2)).min(axis=1)
 
 
 def _fit_arc_divide(arc, max_err_px, min_arc_pts=8):
@@ -567,14 +635,11 @@ def _fit_arc_divide(arc, max_err_px, min_arc_pts=8):
     """
     p0, p3   = arc[0], arc[-1]
     c0, c1   = _lstsq_fit_bezier(p0, p3, arc)
-    err      = _bezier_max_error(p0, c0, c1, p3, arc)
-    if err <= max_err_px or len(arc) < min_arc_pts:
+    dists    = _bezier_point_dists(p0, c0, c1, p3, arc)
+    if float(dists.max()) <= max_err_px or len(arc) < min_arc_pts:
         return [(p3, c0, c1)]
     # Find worst-fitting interior arc point
-    n_samp = max(len(arc) * 2, 64)
-    bpts   = _sample_bezier_np(p0, c0, c1, p3, n=n_samp)
-    diff   = arc[:, None, :] - bpts[None, :, :]
-    dists  = np.sqrt((diff ** 2).sum(axis=2)).min(axis=1)
+    dists    = dists.copy()
     dists[0] = 0.0; dists[-1] = 0.0
     split  = int(np.argmax(dists))
     if split <= 0 or split >= len(arc) - 1:
@@ -635,7 +700,10 @@ def fit_contour(pts, mask, label, verbose=True, is_outer=False):
     corners  = find_corners(s, curv, 15.0, 50)
     tgt_full = _make_tgt(s)
     if len(corners) >= 2:
-        corners = coalesce_corners_by_loss(s, curv, corners, tgt_full)
+        if CORNER_COALESCE == 'gradient':
+            corners = coalesce_corners_by_loss(s, curv, corners, tgt_full)
+        elif CORNER_COALESCE == 'dc':
+            corners = coalesce_corners_dc(s, curv, corners, MAX_BEZIER_ERR_PX)
     if len(corners) < 2:
         corners = [i * n // 4 for i in range(4)]
 
@@ -707,6 +775,7 @@ def atypes_str(at): return ','.join(str(int(x)) for x in at)
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     global N_STEPS_SEG, MAX_BEZIER_ERR_PX, DILATION_PX
+    global KMEANS_SAMPLE, KMEANS_N_INIT, BEZIER_SEARCH, REGION_CROP, CORNER_COALESCE
     parser=argparse.ArgumentParser()
     parser.add_argument('--input',   default='logo-plain-transparent.png')
     parser.add_argument('--output',  default='taos_pass1.svg')
@@ -715,30 +784,51 @@ def main():
     parser.add_argument('--quiet',   action='store_true')
     parser.add_argument('--steps',   type=int, default=0,
                         help='Override all phase step counts')
-    parser.add_argument('--colors',  type=int, default=8,
-                        help='Number of colors to quantize to (default: 8)')
+    parser.add_argument('--colors',  type=int, default=5,
+                        help='Number of colors to quantize to (default: 5)')
     parser.add_argument('--min-px',  type=int, default=MIN_REGION_PX,
                         help='Minimum pixels for a region to be vectorized')
     parser.add_argument('--max-bezier-err', type=float, default=MAX_BEZIER_ERR_PX,
-                        help='Max per-point error (px) for Bézier fitting (default: 2.0)')
+                        help='Max per-point error (px) for Bézier fitting (default: 1.0)')
     parser.add_argument('--dilation-px', type=int, default=DILATION_PX,
-                        help='Mask dilation before contouring (default: 1)')
-    parser.add_argument('--flood-bg', action='store_true',
-                        help='Flood-fill background to transparent before vectorizing')
+                        help='Mask dilation before contouring (default: 0)')
+    parser.add_argument('--flood-bg', action=argparse.BooleanOptionalAction, default=True,
+                        help='Flood-fill background to transparent before vectorizing (default: on)')
     parser.add_argument('--flood-tol', type=int, default=40,
                         help='RGB tolerance for --flood-bg (default: 40)')
+    parser.add_argument('--shadow-tol', type=float, default=0.08,
+                        help='Colour-direction tolerance for removing background-hued drop '
+                             'shadows with --flood-bg; 0 = off (default: 0.08)')
+    parser.add_argument('--kmeans-sample', type=int, default=KMEANS_SAMPLE,
+                        help='Pixels used to fit k-means; 0 = all (default: 0). Sampling can shift the palette')
+    parser.add_argument('--kmeans-n-init', type=int, default=KMEANS_N_INIT,
+                        help='k-means restarts (default: 3)')
+    parser.add_argument('--bezier-search', choices=['kdtree', 'brute'],
+                        default=BEZIER_SEARCH,
+                        help='Nearest-point search for Bézier fit error (default: kdtree)')
+    parser.add_argument('--corner-coalesce', choices=['gradient', 'dc', 'off'],
+                        default=CORNER_COALESCE,
+                        help="Corner pruning: 'gradient' (original, slow), 'dc' "
+                             "(closed-form span count), 'off' (default: dc)")
+    parser.add_argument('--no-region-crop', action='store_true',
+                        help='Disable bounding-box cropping per region (slow legacy path)')
     args=parser.parse_args()
 
     N_STEPS_SEG = args.steps if args.steps > 0 else N_STEPS_SEG
     MAX_BEZIER_ERR_PX = args.max_bezier_err
     DILATION_PX = args.dilation_px
+    KMEANS_SAMPLE = args.kmeans_sample
+    KMEANS_N_INIT = args.kmeans_n_init
+    BEZIER_SEARCH = args.bezier_search
+    REGION_CROP = not args.no_region_crop
+    CORNER_COALESCE = args.corner_coalesce
     verbose=not args.quiet
 
     print(f"Loading {args.input}...")
     arr=np.array(Image.open(args.input).convert('RGBA'))
     arr=remove_black_background(arr)
     if args.flood_bg:
-        arr = flood_fill_background(arr, tol=args.flood_tol)
+        arr = flood_fill_background(arr, tol=args.flood_tol, shadow_tol=args.shadow_tol)
         print(f"Background flood-filled (tol={args.flood_tol})")
     h,w=arr.shape[:2]
 
@@ -753,11 +843,18 @@ def main():
     total_regions = 0
     for li,(hex_color,mask) in enumerate(color_masks):
         cc,n_reg=ndi.label(mask)
-        sizes=sorted([(int(ndi.sum(mask,cc,i)),i)
-                      for i in range(1,n_reg+1)],reverse=True)
+        if REGION_CROP:
+            counts = np.bincount(cc.ravel(), minlength=n_reg + 1)
+            slices = ndi.find_objects(cc)
+            sizes = sorted([(int(counts[i]), i) for i in range(1, n_reg + 1)],
+                           reverse=True)
+        else:
+            slices = None
+            sizes=sorted([(int(ndi.sum(mask,cc,i)),i)
+                          for i in range(1,n_reg+1)],reverse=True)
         qualifying = [(sz,rid) for sz,rid in sizes if sz >= args.min_px]
         total_regions += len(qualifying)
-        layer_data.append((hex_color, mask, cc, qualifying))
+        layer_data.append((hex_color, mask, cc, qualifying, slices))
         print(f"  Layer {li+1}: {hex_color}  ({len(qualifying)} regions)")
     print(f"\nTotal regions to fit: {total_regions}\n")
 
@@ -766,14 +863,27 @@ def main():
 
     svg_layers=[]; t0=time.time()
 
-    for li,(hex_color,mask,cc,qualifying) in enumerate(layer_data):
+    for li,(hex_color,mask,cc,qualifying,slices) in enumerate(layer_data):
         print(f"\n{'='*60}")
         print(f"Layer {li+1}/{len(layer_data)}: {hex_color} | {len(qualifying)} region(s)")
 
         layer_ds=[]
         for region_size,region_id in qualifying:
-            region=(cc==region_id)
-            outer,holes=get_contours(region)
+            if slices is not None:
+                # Crop to the bounding box (clamped to the image, so contours
+                # that touch the image border behave exactly as before).
+                sy, sx = slices[region_id - 1]
+                y0 = max(sy.start - 2, 0); y1 = min(sy.stop + 2, h)
+                x0 = max(sx.start - 2, 0); x1 = min(sx.stop + 2, w)
+                region = (cc[y0:y1, x0:x1] == region_id)
+                outer,holes = get_contours(region)
+                off = np.array([y0, x0], dtype=float)
+                if outer is not None:
+                    outer = outer + off
+                holes = [hc + off for hc in holes]
+            else:
+                region=(cc==region_id)
+                outer,holes=get_contours(region)
             if outer is None:
                 _progress['done'] += 1
                 continue
