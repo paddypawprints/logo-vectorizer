@@ -51,8 +51,10 @@ Command used:
 ```bash
 python src/fit_all.py --input uzumaki.png --output uzumaki.svg \
     --preview uzumaki_preview.png --diff uzumaki_diff.png \
-    --colors 8 --flood-bg
+    --colors 8 --flood-bg --min-px 300 --dilation-px 1 --max-bezier-err 2 --corner-coalesce gradient
 ```
+
+(The defaults have since changed; the command above reproduces that original run.)
 
 ## Algorithm
 
@@ -102,10 +104,14 @@ python fit_all.py --input logo.png --output out.svg --preview out_preview.png --
 | `--output` | `taos_pass1.svg` | Output SVG |
 | `--preview` | `taos_pass1_preview.png` | Rasterized SVG preview |
 | `--diff` | `taos_pass1_diff.png` | 4× pixel diff vs quantized reference |
-| `--colors` | `8` | Number of colors to quantize to |
-| `--min-px` | `300` | Ignore regions smaller than this many pixels |
-| `--flood-bg` | off | Flood-fill background to transparent before vectorizing |
+| `--colors` | `5` | Number of colors to quantize to |
+| `--min-px` | `20` | Ignore regions smaller than this many pixels |
+| `--flood-bg` / `--no-flood-bg` | on | Flood-fill background to transparent before vectorizing |
 | `--flood-tol` | `40` | RGB tolerance for `--flood-bg` |
+| `--shadow-tol` | `0.08` | Hue tolerance for removing background-coloured drop shadows connected to the background; `0` = off |
+| `--max-bezier-err` | `1.0` | Max per-point error (px) before a Bézier span splits |
+| `--dilation-px` | `0` | Mask dilation before contouring |
+| `--corner-coalesce` | `dc` | `dc` (closed-form), `gradient` (original, slow) or `off` |
 | `--quiet` | off | Suppress per-region progress output |
 
 ## Tunable parameters
@@ -116,8 +122,8 @@ At the top of `fit_all.py`:
 |-----------|---------|--------|
 | `N_PIX` | `10` | Max anchor spacing = √2 × N_PIX px |
 | `SHARP_THRESH` | `40.0°` | Curvature above this → sharp corner (C0 kink allowed) |
-| `MAX_BEZIER_ERR_PX` | `2.0` | Max per-point error before D&C splits a span |
-| `DILATION_PX` | `1` | Mask dilation before contouring (fills 1px gaps) |
+| `MAX_BEZIER_ERR_PX` | `1.0` | Max per-point error before D&C splits a span |
+| `DILATION_PX` | `0` | Mask dilation before contouring |
 
 ## License
 
